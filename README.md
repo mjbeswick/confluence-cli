@@ -26,6 +26,19 @@ A powerful command-line interface for Atlassian Confluence that allows you to re
 
 ## Installation
 
+### Rust migration preview
+
+The project is incrementally developing a Rust implementation alongside the existing Node.js CLI. The Rust preview currently supports explicit agent-skill discovery only; it does **not** replace the `confluence` command or perform Confluence API operations.
+
+With Rust installed, run from a checkout:
+
+```bash
+cargo run --manifest-path rust/Cargo.toml -- skills list
+cargo run --manifest-path rust/Cargo.toml -- skills show confluence
+```
+
+Add `--json` for machine-readable skill metadata/content. See [the Rust migration notes](docs/RUST-MIGRATION.md) for status, build instructions, and compatibility gates.
+
 ### Homebrew (macOS/Linux)
 
 ```bash

@@ -86,3 +86,6 @@ Thumbs.db
 
 # Configuration files with sensitive data
 config.json
+
+# Rust build output
+target/

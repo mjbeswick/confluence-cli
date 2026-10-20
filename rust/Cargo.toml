@@ -1,0 +1,14 @@
+[package]
+name = "confluence-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust migration workspace for confluence-cli"
+license = "MIT"
+publish = false
+
+[dev-dependencies]
+serde_json = "1"
+
+[[bin]]
+name = "confluence-rs"
+path = "src/main.rs"
