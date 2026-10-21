@@ -1,7 +1,15 @@
 use std::process::{Command, Output};
 
+/// Isolate from a developer's or CI runner's ambient `CONFLUENCE_*`
+/// environment so skill discovery tests can never depend on, or be broken
+/// by, real credentials or configuration that happen to be set locally.
 fn run(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_confluence-rs"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_confluence-cli"));
+    command.env_clear();
+    if let Ok(path) = std::env::var("PATH") {
+        command.env("PATH", path);
+    }
+    command
         .args(args)
         .output()
         .expect("Rust preview binary should run")
@@ -54,6 +62,19 @@ fn default_help_does_not_dump_skill_content() {
     let help = String::from_utf8(output.stdout).unwrap();
 
     assert!(output.status.success());
-    assert!(help.contains("skills list"));
+    assert!(help.contains("Discover agent workflow guidance"));
     assert!(!help.contains("CONFLUENCE_API_TOKEN"));
+}
+
+#[test]
+fn unknown_command_with_json_returns_structured_error_and_nonzero_status() {
+    let output = run(&["not-a-command", "--json"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["code"], "VALIDATION");
+    assert!(error["error"]
+        .as_str()
+        .unwrap()
+        .contains("unrecognized subcommand"));
 }

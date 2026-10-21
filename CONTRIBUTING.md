@@ -50,7 +50,7 @@ The Rust crate lives in `rust/` and is intentionally developed alongside the Nod
 ```bash
 cargo fmt --manifest-path rust/Cargo.toml -- --check
 cargo test --manifest-path rust/Cargo.toml
-cargo run --manifest-path rust/Cargo.toml -- skills list --json
+cargo run --manifest-path rust/Cargo.toml --bin confluence-cli -- skills list --json
 ```
 
 Do not redirect the production `confluence` executable or remove Node integrations as part of a Rust slice. See [docs/RUST-MIGRATION.md](docs/RUST-MIGRATION.md) for migration constraints and parity gates.

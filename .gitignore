@@ -89,3 +89,6 @@ config.json
 
 # Rust build output
 target/
+
+# Serena MCP tool-local state (not project source)
+.serena/
