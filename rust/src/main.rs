@@ -120,8 +120,26 @@ enum Command {
         file: Option<String>,
         #[arg(long)]
         recursive: bool,
+        #[arg(long, default_value_t = 10)]
+        max_depth: u32,
+        #[arg(long)]
+        exclude: Option<String>,
+        #[arg(long, default_value = "100")]
+        delay_ms: String,
+        #[arg(long, default_value = "attachments")]
+        attachments_dir: String,
+        #[arg(long)]
+        pattern: Option<String>,
+        #[arg(long)]
+        exclude_attachments: Option<String>,
+        #[arg(long)]
+        referenced_only: bool,
         #[arg(long)]
         skip_attachments: bool,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        overwrite: bool,
     },
     /// Create a Confluence page.
     Create {
@@ -184,12 +202,21 @@ enum Command {
     CopyTree {
         source_page_id: String,
         target_parent_id: String,
-        #[arg(long)]
         title: Option<String>,
         #[arg(long)]
         dry_run: bool,
         #[arg(long)]
         max_depth: Option<u32>,
+        #[arg(long)]
+        exclude: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        delay_ms: u64,
+        #[arg(long, default_value = " (Copy)")]
+        copy_suffix: String,
+        #[arg(long)]
+        fail_on_error: bool,
+        #[arg(short, long)]
+        quiet: bool,
     },
     /// Delete a page. Destructive use requires --yes.
     Delete {
@@ -317,10 +344,10 @@ enum Command {
     /// Preview and optionally purge old versions, keeping the newest N.
     VersionsPurge {
         page_id: String,
-        #[arg(long, default_value_t = 5)]
-        keep: u32,
         #[arg(long)]
         yes: bool,
+        #[arg(long, default_value = "0")]
+        throttle: String,
     },
     /// Resolve or reopen a comment thread.
     CommentResolve {
@@ -1051,10 +1078,24 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     format,
                     file,
                     recursive,
+                    max_depth,
+                    exclude,
+                    delay_ms,
+                    attachments_dir,
+                    pattern,
+                    exclude_attachments,
+                    referenced_only,
                     skip_attachments,
+                    dry_run,
+                    overwrite,
                 } => {
-                    if recursive {
-                        return Err(CliError::new("Recursive export is not implemented in the Rust preview yet; use the Node.js CLI.", "VALIDATION", 2, false));
+                    if cli.json {
+                        return Err(CliError::new(
+                            "--json is not supported by \"export\".",
+                            "VALIDATION",
+                            1,
+                            true,
+                        ));
                     }
                     if !["markdown", "html", "storage", "text"].contains(&format.as_str()) {
                         return Err(CliError::new(
@@ -1064,13 +1105,45 @@ fn run(cli: Cli) -> Result<(), CliError> {
                             false,
                         ));
                     }
+                    let options = client::ExportOptions {
+                        format: format.to_lowercase(),
+                        filename: file,
+                        recursive,
+                        max_depth,
+                        exclude,
+                        delay_ms: delay_ms.trim().parse::<u64>().unwrap_or(100),
+                        attachments_dir,
+                        pattern,
+                        exclude_attachments,
+                        referenced_only,
+                        skip_attachments,
+                        dry_run,
+                        overwrite,
+                    };
                     let result = client
-                        .export_page(&page_id, &dest, &format, file.as_deref(), skip_attachments)
-                        .map_err(|error| error.with_json(false))?;
-                    println!(
-                        "Exported page to {}",
-                        result["contentPath"].as_str().unwrap_or_default()
-                    );
+                        .export(&page_id, &dest, &options)
+                        .map_err(|error| error.with_json(cli.json))?;
+                    if result["dryRun"] == true {
+                        if cli.json {
+                            print_json(&result);
+                        } else {
+                            println!(
+                                "Dry run — no files written.\n{} page(s) selected for export.",
+                                result["pageCount"]
+                            );
+                        }
+                    } else {
+                        if cli.json {
+                            print_json(&result);
+                        } else {
+                            println!(
+                                "Exported {}/{} page(s) to {}",
+                                result["exported"],
+                                result["pageCount"],
+                                result["rootDirectory"].as_str().unwrap_or_default()
+                            );
+                        }
+                    }
                     Ok(())
                 }
                 Command::Create {
@@ -1285,12 +1358,57 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     title,
                     dry_run,
                     max_depth,
+                    exclude,
+                    delay_ms,
+                    copy_suffix,
+                    fail_on_error,
+                    quiet,
                 } => {
+                    let excluded = exclude
+                        .unwrap_or_default()
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|pattern| !pattern.is_empty())
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>();
+                    let delay_ms = delay_ms.min(3_600_000);
+                    let copy_options = client::CopyTreeOptions {
+                        max_depth: max_depth.unwrap_or(10),
+                        exclude: excluded,
+                        delay_ms,
+                        copy_suffix,
+                        quiet,
+                    };
+                    let target_info = client
+                        .info(&target_parent_id)
+                        .map_err(|error| error.with_json(cli.json))?;
                     let (plan, _) = client
-                        .copy_tree_plan(&source_page_id, max_depth.unwrap_or(10))
+                        .copy_tree_plan(&source_page_id, &copy_options)
                         .map_err(|e| e.with_json(cli.json))?;
+                    if plan.is_empty() {
+                        return Err(CliError::new(
+                            "Could not plan the source page tree.",
+                            "NOT_FOUND",
+                            1,
+                            cli.json,
+                        ));
+                    }
+                    if plan.first().and_then(|page| page["spaceKey"].as_str())
+                        != target_info.space.as_ref().map(|space| space.key.as_str())
+                    {
+                        return Err(CliError::new("Cannot copy pages across spaces. Source and target parent must be in the same space.", "VALIDATION", 1, cli.json));
+                    }
                     if dry_run {
-                        let preview = serde_json::json!({"sourcePageId":source_page_id,"targetParentId":target_parent_id,"pageCount":plan.len(),"pages":plan,"newTitle":title});
+                        let root_title = title.clone().unwrap_or_else(|| {
+                            format!(
+                                "{}{}",
+                                plan.first()
+                                    .and_then(|page| page["title"].as_str())
+                                    .unwrap_or("Untitled"),
+                                copy_options.copy_suffix
+                            )
+                        });
+                        let preview = serde_json::json!({"dryRun":true,"rootTitle":root_title,"sourcePageId":plan.first().and_then(|page|page["id"].as_str()).unwrap_or(&source_page_id),"sourceVersion":plan.first().and_then(|page|page["version"].as_u64()),"targetParentId":target_info.id,"targetParentVersion":target_info.version,"childCount":plan.len().saturating_sub(1),"pages":plan});
                         if cli.json {
                             print_json(&preview);
                         } else {
@@ -1298,28 +1416,51 @@ fn run(cli: Cli) -> Result<(), CliError> {
                         }
                         return Ok(());
                     }
-                    confirm_write(
-                        json_mode,
-                        format!(
-                            "Copy {} pages from {source_page_id} to {target_parent_id}?",
-                            plan.len()
-                        ),
-                    )?;
+                    if !cli.json {
+                        confirm_write(
+                            json_mode,
+                            format!(
+                                "Copy {} pages from {source_page_id} to {target_parent_id}?",
+                                plan.len()
+                            ),
+                        )?;
+                    }
                     let result = client
                         .copy_tree_execute(
                             &source_page_id,
                             &target_parent_id,
                             title.as_deref(),
+                            &copy_options,
                             &plan,
                         )
                         .map_err(|e| e.with_json(cli.json))?;
                     if cli.json {
                         print_json(&result);
-                    } else {
+                    } else if quiet {
                         println!(
                             "Copied {} pages.",
-                            result["created"].as_array().map_or(0, Vec::len)
+                            result["totalCopied"].as_u64().unwrap_or_default()
                         );
+                    } else {
+                        println!(
+                            "✅ Page tree copy completed\nTotal copied pages: {}",
+                            result["totalCopied"].as_u64().unwrap_or_default()
+                        );
+                    }
+                    if fail_on_error
+                        && result["failures"]
+                            .as_array()
+                            .is_some_and(|failures| !failures.is_empty())
+                    {
+                        if cli.json {
+                            std::process::exit(1);
+                        }
+                        return Err(CliError::new(
+                            "Copy completed with failures and --fail-on-error is set.",
+                            "API_ERROR",
+                            1,
+                            false,
+                        ));
                     }
                     Ok(())
                 }
@@ -1821,12 +1962,15 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     version_number,
                     yes,
                 } => {
+                    if !yes && cli.json {
+                        return Err(CliError::new("Refusing to delete without confirmation in --json mode. Pass --yes to proceed.", "VALIDATION", 1, true));
+                    }
                     if !yes && !std::io::stdin().is_terminal() {
                         return Err(CliError::new(
                             "Deleting a version requires --yes in non-interactive mode.",
                             "VALIDATION",
                             1,
-                            cli.json,
+                            false,
                         ));
                     }
                     if !yes && !Confirm::new().with_prompt(format!("Delete version {version_number} from page {page_id}? This cannot be undone.")).default(false).interact().unwrap_or(false) { return Ok(()); }
@@ -1835,36 +1979,63 @@ fn run(cli: Cli) -> Result<(), CliError> {
                         .map_err(|e| e.with_json(cli.json))?;
                     if cli.json {
                         print_json(
-                            &serde_json::json!({"pageId":page_id,"versionNumber":version_number,"deleted":true}),
+                            &serde_json::json!({"id":page_id,"versionNumber":version_number,"deleted":true}),
                         );
                     } else {
                         println!("Version {version_number} deleted from {page_id}.");
                     }
                     Ok(())
                 }
-                Command::VersionsPurge { page_id, keep, yes } => {
+                Command::VersionsPurge {
+                    page_id,
+                    yes,
+                    throttle,
+                } => {
                     let preview = client
-                        .versions_purge_preview(&page_id, keep)
+                        .versions_purge_preview(&page_id, 1)
                         .map_err(|error| error.with_json(cli.json))?;
-                    if !yes {
+                    if preview["deletions"]
+                        .as_array()
+                        .is_none_or(|rows| rows.is_empty())
+                    {
                         if cli.json {
-                            print_json(&preview);
+                            print_json(
+                                &serde_json::json!({"id":preview["pageId"],"deleted":0,"failed":0,"kept":preview["currentVersion"]}),
+                            );
                         } else {
-                            println!("{} versions would be removed. Inspect the preview, then rerun with --yes.", preview["deletions"].as_array().map_or(0, Vec::len));
+                            println!(
+                                "Nothing to purge; current version {} will be kept.",
+                                preview["currentVersion"]
+                            );
                         }
                         return Ok(());
                     }
-                    confirm_write(
-                        json_mode,
-                        format!(
-                            "Purge {} historical versions from page {page_id}?",
-                            preview["deletions"].as_array().map_or(0, Vec::len)
-                        ),
-                    )?;
+                    if !yes {
+                        confirm_write(
+                            json_mode,
+                            format!(
+                                "Purge {} historical versions from page {page_id}?",
+                                preview["deletions"].as_array().map_or(0, Vec::len)
+                            ),
+                        )?;
+                    }
+                    let throttle_ms =
+                        throttle.trim().parse::<f64>().unwrap_or(0.0).max(0.0) * 1000.0;
                     let result = client
-                        .versions_purge_execute(&page_id, &preview)
+                        .versions_purge_execute(&page_id, &preview, throttle_ms.round() as u64)
                         .map_err(|error| error.with_json(cli.json))?;
                     emit_json_or_pretty(cli.json, &result);
+                    if result["failed"].as_u64().unwrap_or_default() > 0 {
+                        if cli.json {
+                            std::process::exit(1);
+                        }
+                        return Err(CliError::new(
+                            "Version purge completed with failures.",
+                            "API_ERROR",
+                            1,
+                            false,
+                        ));
+                    }
                     Ok(())
                 }
                 Command::CommentResolve { comment_id, reopen } => {

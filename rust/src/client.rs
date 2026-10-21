@@ -7,6 +7,31 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 
+#[derive(Clone, Debug)]
+pub struct ExportOptions {
+    pub format: String,
+    pub filename: Option<String>,
+    pub recursive: bool,
+    pub max_depth: u32,
+    pub exclude: Option<String>,
+    pub delay_ms: u64,
+    pub attachments_dir: String,
+    pub pattern: Option<String>,
+    pub exclude_attachments: Option<String>,
+    pub referenced_only: bool,
+    pub skip_attachments: bool,
+    pub dry_run: bool,
+    pub overwrite: bool,
+}
+
+pub struct CopyTreeOptions {
+    pub max_depth: u32,
+    pub exclude: Vec<String>,
+    pub delay_ms: u64,
+    pub copy_suffix: String,
+    pub quiet: bool,
+}
+
 #[derive(Debug)]
 pub struct ClientError {
     pub message: String,
@@ -530,6 +555,15 @@ impl ConfluenceClient {
     }
 
     pub fn descendants(&self, page_id: &str, limit: u32) -> Result<Vec<Value>, ClientError> {
+        self.descendants_to_depth(page_id, limit, u32::MAX)
+    }
+
+    fn descendants_to_depth(
+        &self,
+        page_id: &str,
+        limit: u32,
+        max_depth: u32,
+    ) -> Result<Vec<Value>, ClientError> {
         let root = extract_page_id(page_id).ok_or_else(|| ClientError {
             message: "Could not extract a page ID from the supplied value.".into(),
             code: "VALIDATION",
@@ -540,9 +574,12 @@ impl ConfluenceClient {
             self.validate_page_url(page_id)?;
         }
         let mut output = Vec::new();
-        let mut queue = vec![(root.clone(), 1u64)];
+        let mut queue = std::collections::VecDeque::from([(root.clone(), 1u64)]);
         let mut scanned = std::collections::HashSet::new();
-        while let Some((parent, depth)) = queue.pop() {
+        while let Some((parent, depth)) = queue.pop_front() {
+            if depth > u64::from(max_depth) {
+                continue;
+            }
             if !scanned.insert(parent.clone()) {
                 continue;
             }
@@ -553,7 +590,9 @@ impl ConfluenceClient {
             )? {
                 child["depth"] = Value::from(depth);
                 if let Some(id) = child.get("id").and_then(Value::as_str) {
-                    queue.push((id.to_owned(), depth + 1));
+                    if depth < u64::from(max_depth) {
+                        queue.push_back((id.to_owned(), depth + 1));
+                    }
                 }
                 output.push(child);
             }
@@ -565,7 +604,7 @@ impl ConfluenceClient {
     pub fn copy_tree_plan(
         &self,
         root_page_id: &str,
-        max_depth: u32,
+        options: &CopyTreeOptions,
     ) -> Result<(Vec<Value>, Vec<(String, String)>), ClientError> {
         let root = extract_page_id(root_page_id).ok_or_else(|| ClientError {
             message: "Could not extract a source page ID.".into(),
@@ -577,10 +616,11 @@ impl ConfluenceClient {
         let mut rows = vec![
             serde_json::json!({"id":root,"title":root_info.title,"type":root_info.page_type,"depth":0,"parentId":null,"spaceKey":root_info.space_key}),
         ];
+        let mut visited = std::collections::HashSet::from([root.clone()]);
         let mut edges = Vec::new();
-        let mut queue = vec![(root.clone(), 0u32)];
-        while let Some((parent, depth)) = queue.pop() {
-            if depth >= max_depth {
+        let mut queue = std::collections::VecDeque::from([(root.clone(), 0u32)]);
+        while let Some((parent, depth)) = queue.pop_front() {
+            if depth >= options.max_depth {
                 continue;
             }
             for child in self.children(&parent, 500)? {
@@ -589,13 +629,26 @@ impl ConfluenceClient {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned();
-                if id.is_empty() {
+                if id.is_empty() || visited.contains(&id) {
+                    continue;
+                }
+                if numeric_id(&id).is_none() {
                     continue;
                 }
                 let mut child = child;
+                let child_title = child.get("title").and_then(Value::as_str).unwrap_or("");
+                if options
+                    .exclude
+                    .iter()
+                    .any(|pattern| glob_match(pattern, child_title))
+                {
+                    continue;
+                }
+                visited.insert(id.clone());
                 child["depth"] = Value::from(depth + 1);
+                child["parentId"] = Value::String(parent.clone());
                 edges.push((id.clone(), parent.clone()));
-                queue.push((id, depth + 1));
+                queue.push_back((id, depth + 1));
                 rows.push(child);
             }
         }
@@ -607,38 +660,70 @@ impl ConfluenceClient {
         source_page_id: &str,
         target_parent_id: &str,
         new_title: Option<&str>,
+        options: &CopyTreeOptions,
         plan: &[Value],
     ) -> Result<Value, ClientError> {
+        let source_page_id =
+            extract_page_id(source_page_id).unwrap_or_else(|| source_page_id.to_owned());
+        let target_parent_id =
+            extract_page_id(target_parent_id).unwrap_or_else(|| target_parent_id.to_owned());
         let mut created = Vec::new();
         let mut remap = std::collections::HashMap::<String, String>::new();
-        for page in plan {
+        let mut failures = Vec::new();
+        for (index, page) in plan.iter().enumerate() {
             let old_id = page.get("id").and_then(Value::as_str).unwrap_or_default();
             let parent_id = if old_id == source_page_id {
-                target_parent_id.to_owned()
+                target_parent_id.clone()
             } else {
-                remap
-                    .get(
-                        page.get("parentId")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default(),
-                    )
-                    .cloned()
-                    .unwrap_or_else(|| target_parent_id.to_owned())
+                let old_parent = page
+                    .get("parentId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let Some(mapped_parent) = remap.get(old_parent).cloned() else {
+                    failures.push(serde_json::json!({"id":old_id,"title":page["title"],"error":"Parent page was not copied; skipping descendant."}));
+                    continue;
+                };
+                mapped_parent
             };
-            let info = self.get(
+            if numeric_id(old_id).is_none() {
+                failures.push(serde_json::json!({"id":old_id,"title":page["title"],"error":"Page ID is not numeric."}));
+                continue;
+            }
+            if !options.quiet {
+                eprintln!(
+                    "Copying {} ({old_id})",
+                    page["title"].as_str().unwrap_or("Untitled")
+                );
+            }
+            let info = match self.get(
                 &format!("/content/{old_id}"),
                 &[("expand", "body.storage,space".into())],
-            )?;
+            ) {
+                Ok(info) => info,
+                Err(error) => {
+                    if !options.quiet {
+                        eprintln!(
+                            "Failed: {} — {}",
+                            page["title"].as_str().unwrap_or("Untitled"),
+                            error.message
+                        );
+                    }
+                    failures.push(serde_json::json!({"id":old_id,"title":page["title"],"error":error.message,"status":error.status}));
+                    continue;
+                }
+            };
             let title = if old_id == source_page_id {
-                new_title.unwrap_or_else(|| {
+                new_title.map(str::to_owned).unwrap_or_else(|| {
                     page.get("title")
                         .and_then(Value::as_str)
-                        .unwrap_or("Untitled")
+                        .map(|name| format!("{name}{}", options.copy_suffix))
+                        .unwrap_or_else(|| format!("Untitled{}", options.copy_suffix))
                 })
             } else {
                 page.get("title")
                     .and_then(Value::as_str)
                     .unwrap_or("Untitled")
+                    .to_owned()
             };
             let body = info
                 .get("body")
@@ -646,14 +731,54 @@ impl ConfluenceClient {
                 .and_then(|v| v.get("value"))
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let result = self.create_child_page(title, &parent_id, body, "storage")?;
-            if let Some(new_id) = result.get("id").and_then(Value::as_str) {
-                remap.insert(old_id.to_owned(), new_id.to_owned());
+            match self.create_child_page(&title, &parent_id, body, "storage") {
+                Ok(result) => {
+                    let Some(new_id) = result.get("id").and_then(Value::as_str) else {
+                        let error = validation_error(
+                            "Confluence did not return an ID for a created copy-tree page.",
+                        );
+                        if old_id == source_page_id {
+                            return Err(error);
+                        }
+                        failures.push(
+                            serde_json::json!({"id":old_id,"title":title,"error":error.message}),
+                        );
+                        continue;
+                    };
+                    if remap.values().any(|existing| existing == new_id) {
+                        return Err(validation_error(
+                            "Confluence returned a duplicate created-page ID during copy-tree.",
+                        ));
+                    }
+                    remap.insert(old_id.to_owned(), new_id.to_owned());
+                    created.push(result);
+                }
+                Err(error) if old_id == source_page_id => return Err(error),
+                Err(error) => {
+                    if !options.quiet {
+                        eprintln!("Failed: {title} — {}", error.message);
+                    }
+                    failures.push(serde_json::json!({"id":old_id,"title":title,"error":error.message,"status":error.status}));
+                }
             }
-            created.push(result);
+            if options.delay_ms > 0 && index + 1 < plan.len() {
+                std::thread::sleep(Duration::from_millis(options.delay_ms));
+            }
         }
+        let root_page = created
+            .first()
+            .map(|page| {
+                let url = page
+                    .get("_links")
+                    .and_then(|links| links.get("webui"))
+                    .and_then(Value::as_str)
+                    .map(|path| self.build_url(path))
+                    .unwrap_or_default();
+                serde_json::json!({"id":page.get("id"),"title":page.get("title"),"url":url})
+            })
+            .unwrap_or(Value::Null);
         Ok(
-            serde_json::json!({"sourcePageId":source_page_id,"targetParentId":target_parent_id,"created":created}),
+            serde_json::json!({"rootPage":root_page,"totalCopied":created.len(),"failures":failures}),
         )
     }
 
@@ -1868,21 +1993,25 @@ impl ConfluenceClient {
         let mut all = Vec::new();
         let mut start = 0u32;
         let limit = 200u32;
+        let mut use_experimental = false;
         loop {
-            let response = match self.get(
-                &format!("/content/{id}/version"),
-                &[("limit", limit.to_string()), ("start", start.to_string())],
-            ) {
-                Ok(response) => response,
-                Err(error) if matches!(error.status, Some(404 | 405)) => self.get(
+            let response = if use_experimental {
+                self.get(
+                    &format!("{}/content/{id}/version", self.experimental_base()),
+                    &[("limit", limit.to_string()), ("start", start.to_string())],
+                )?
+            } else {
+                match self.get(
                     &format!("/content/{id}/version"),
-                    &[
-                        ("limit", limit.to_string()),
-                        ("start", start.to_string()),
-                        ("api", "experimental".into()),
-                    ],
-                )?,
-                Err(error) => return Err(error),
+                    &[("limit", limit.to_string()), ("start", start.to_string())],
+                ) {
+                    Ok(response) => response,
+                    Err(error) if matches!(error.status, Some(404 | 405)) => {
+                        use_experimental = true;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
             };
             let rows = response
                 .get("results")
@@ -1924,10 +2053,22 @@ impl ConfluenceClient {
         })?;
         let versions = self.versions(&id)?;
         let rows = versions
-            .get("results")
+            .get("versions")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        let requested = version as u64;
+        if !rows
+            .iter()
+            .any(|row| row.get("number").and_then(Value::as_u64) == Some(requested))
+        {
+            return Err(ClientError {
+                message: format!("Version {version} was not found."),
+                code: "NOT_FOUND",
+                status: Some(404),
+                details: None,
+            });
+        }
         let current = rows
             .iter()
             .filter_map(|row| row.get("number").and_then(Value::as_u64))
@@ -1941,7 +2082,7 @@ impl ConfluenceClient {
                 details: None,
             });
         }
-        self.delete(&format!("/content/{id}/version/{version}"))
+        self.delete_version_endpoint(&id, u64::from(version))
     }
 
     pub fn versions_purge_preview(&self, page_id: &str, keep: u32) -> Result<Value, ClientError> {
@@ -1961,14 +2102,20 @@ impl ConfluenceClient {
         })?;
         let versions = self.versions(&id)?;
         let mut rows = versions
-            .get("results")
+            .get("versions")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
         rows.sort_by_key(|row| row.get("number").and_then(Value::as_u64).unwrap_or(0));
         let deletions = rows
             .iter()
-            .take(rows.len().saturating_sub(keep as usize))
+            .filter(|row| {
+                row.get("number").and_then(Value::as_u64)
+                    != rows
+                        .last()
+                        .and_then(|last| last.get("number"))
+                        .and_then(Value::as_u64)
+            })
             .filter_map(|row| row.get("number").and_then(Value::as_u64))
             .collect::<Vec<_>>();
         Ok(
@@ -1980,6 +2127,7 @@ impl ConfluenceClient {
         &self,
         page_id: &str,
         preview: &Value,
+        throttle_ms: u64,
     ) -> Result<Value, ClientError> {
         if self.auth_is_read_only() {
             return Err(ClientError {
@@ -2004,11 +2152,10 @@ impl ConfluenceClient {
                 details: None,
             });
         }
-        let fresh = self.versions_purge_preview(
-            &id,
-            preview.get("keep").and_then(Value::as_u64).unwrap_or(5) as u32,
-        )?;
-        if fresh["deletions"] != preview["deletions"]
+        let keep = preview.get("keep").and_then(Value::as_u64).unwrap_or(1) as u32;
+        let fresh = self.versions_purge_preview(&id, keep)?;
+        if fresh["keep"] != preview["keep"]
+            || fresh["deletions"] != preview["deletions"]
             || fresh["currentVersion"] != preview["currentVersion"]
         {
             return Err(ClientError {
@@ -2020,21 +2167,42 @@ impl ConfluenceClient {
         }
         let mut deleted = Vec::new();
         let mut failures = Vec::new();
-        for version in preview["deletions"]
+        let mut deletions = preview["deletions"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(Value::as_u64)
-        {
-            match self.delete(&format!("/content/{id}/version/{version}")) {
+            .collect::<Vec<_>>();
+        // Delete newest historical versions first. Some Confluence builds
+        // renumber remaining versions after each removal.
+        deletions.sort_unstable_by(|left, right| right.cmp(left));
+        for version in deletions {
+            match self.delete_version_endpoint(&id, version) {
                 Ok(()) => deleted.push(version),
                 Err(error) => failures
                     .push(serde_json::json!({"versionNumber":version,"message":error.message})),
             }
+            if throttle_ms > 0 {
+                std::thread::sleep(Duration::from_millis(throttle_ms));
+            }
         }
         Ok(
-            serde_json::json!({"pageId":id,"deleted":deleted,"failed":failures.len(),"errors":failures}),
+            serde_json::json!({"id":id,"deleted":deleted.len(),"deletedVersions":deleted,"failed":failures.len(),"errors":failures,"kept":preview["currentVersion"]}),
         )
+    }
+
+    fn delete_version_endpoint(&self, page_id: &str, version: u64) -> Result<(), ClientError> {
+        match self.delete(&format!("/content/{page_id}/version/{version}")) {
+            Ok(()) => Ok(()),
+            Err(error) if matches!(error.status, Some(404 | 405)) => {
+                let url = format!(
+                    "{}/content/{page_id}/version/{version}",
+                    self.experimental_base()
+                );
+                self.delete_absolute(&url)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Resolve or reopen a top-level inline comment thread (Confluence Cloud only).
@@ -2192,6 +2360,42 @@ impl ConfluenceClient {
             base,
             "/api/v2"
         )
+    }
+
+    fn experimental_base(&self) -> String {
+        let origin = self.base_url.trim_end_matches(&self.api_path);
+        let prefix = self.api_path.strip_suffix("/rest/api").unwrap_or("");
+        format!("{origin}{prefix}/rest/experimental")
+    }
+
+    fn delete_absolute(&self, url: &str) -> Result<(), ClientError> {
+        self.validate_page_url(url)?;
+        if self.auth_is_read_only() {
+            return Err(validation_error(
+                "This profile is in read-only mode. Write operations are not allowed.",
+            ));
+        }
+        let response = self
+            .client
+            .delete(url)
+            .send()
+            .map_err(|error| ClientError {
+                message: format!("Network request failed: {error}"),
+                code: "NETWORK",
+                status: None,
+                details: None,
+            })?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            let status = response.status().as_u16();
+            Err(ClientError {
+                message: format!("Confluence API returned HTTP {status}."),
+                code: "API_ERROR",
+                status: Some(status),
+                details: None,
+            })
+        }
     }
 
     fn delete(&self, path: &str) -> Result<(), ClientError> {
@@ -2384,72 +2588,194 @@ impl ConfluenceClient {
         })
     }
 
-    pub fn export_page(
+    pub fn export(
         &self,
         page_id: &str,
         destination: &str,
-        format: &str,
-        filename: Option<&str>,
-        skip_attachments: bool,
+        options: &ExportOptions,
     ) -> Result<Value, ClientError> {
-        let info = self.info(page_id)?;
-        let title = info.title.clone();
-        let folder = sanitize_path_component(&title);
-        let extension = match format {
+        if reqwest::Url::parse(page_id).is_ok() {
+            self.validate_page_url(page_id)?;
+        }
+        let root_id = extract_page_id(page_id).ok_or_else(|| {
+            validation_error("Could not extract a page ID from the supplied value.")
+        })?;
+        let root = self.info(&root_id)?;
+        let format = options.format.to_lowercase();
+        let extension = match format.as_str() {
             "markdown" => "md",
             "html" => "html",
             "text" => "txt",
-            "storage" => "xml",
+            "storage" => "txt",
             _ => {
-                return Err(ClientError {
-                    message: "Export format must be markdown, html, storage, or text.".into(),
-                    code: "VALIDATION",
-                    status: None,
-                    details: None,
-                })
+                return Err(validation_error(
+                    "Export format must be markdown, html, storage, or text.",
+                ))
             }
         };
-        let directory = std::path::PathBuf::from(destination).join(folder);
-        let default_filename = format!("page.{extension}");
-        let content_path = directory.join(filename.unwrap_or(&default_filename));
-        if !content_path.starts_with(&directory) {
-            return Err(ClientError {
-                message: "Export filename must remain inside export directory.".into(),
-                code: "VALIDATION",
-                status: None,
-                details: None,
-            });
+        if options.recursive && options.max_depth == 0 {
+            return Err(validation_error("--max-depth must be greater than zero."));
         }
-        let content = self.read(page_id, format)?;
-        std::fs::create_dir_all(&directory).map_err(|error| ClientError {
-            message: format!("Could not create export directory: {error}"),
-            code: "UNKNOWN",
-            status: None,
-            details: None,
-        })?;
-        std::fs::write(&content_path, &content).map_err(|error| ClientError {
-            message: format!("Could not write page export: {error}"),
-            code: "UNKNOWN",
-            status: None,
-            details: None,
-        })?;
-        let mut downloaded = 0usize;
-        if !skip_attachments {
-            let attachments = self.attachments(page_id)?;
-            let items = attachments
-                .get("attachments")
-                .and_then(Value::as_array)
+        if !options.attachments_dir.is_empty() {
+            validate_relative_component(&options.attachments_dir, "Attachment directory")?;
+        }
+        let base = std::path::PathBuf::from(destination);
+        let root_dir = base.join(sanitize_title(&root.title));
+        let mut pages =
+            vec![serde_json::json!({"id":root.id,"title":root.title,"parentId":null,"depth":0})];
+        if options.recursive {
+            let exclude = split_patterns(options.exclude.as_deref());
+            let descendants = self.descendants_to_depth(&root_id, 500, options.max_depth)?;
+            let mut included = std::collections::HashSet::from([root_id.clone()]);
+            for page in descendants {
+                let parent = page
+                    .get("parentId")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&root_id);
+                let title = page
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Untitled");
+                if included.contains(parent)
+                    && !exclude.iter().any(|pattern| glob_match(pattern, title))
+                {
+                    if let Some(id) = page.get("id").and_then(Value::as_str) {
+                        included.insert(id.to_owned());
+                        pages.push(page);
+                    }
+                }
+            }
+        }
+        if options.dry_run {
+            return Ok(
+                serde_json::json!({"dryRun":true,"pageCount":pages.len(),"rootDirectory":root_dir,"pages":pages}),
+            );
+        }
+        if options.overwrite && root_dir.exists() {
+            let marker = root_dir.join(EXPORT_MARKER);
+            if !marker.is_file() {
+                return Err(validation_error(&format!("Refusing to overwrite \"{}\" - it was not created by confluence-cli (missing {EXPORT_MARKER}).", root_dir.display())));
+            }
+            std::fs::remove_dir_all(&root_dir)
+                .map_err(|error| file_error("Could not remove previous export", error))?;
+        }
+        let mut directories = std::collections::HashMap::new();
+        directories.insert(root_id.clone(), root_dir.clone());
+        std::fs::create_dir_all(&root_dir)
+            .map_err(|error| file_error("Could not create export directory", error))?;
+        let mut failures = Vec::new();
+        let mut exported = 0usize;
+        self.export_one_page(&root_id, &root.title, &root_dir, extension, options)?;
+        exported += 1;
+        if options.recursive {
+            for page in pages.iter().skip(1) {
+                if options.delay_ms > 0 {
+                    std::thread::sleep(Duration::from_millis(options.delay_ms));
+                }
+                let id = page["id"].as_str().unwrap_or_default();
+                let title = page["title"].as_str().unwrap_or("Untitled");
+                let parent = page["parentId"].as_str().unwrap_or(&root_id);
+                let Some(parent_dir) = directories.get(parent).cloned() else {
+                    failures.push(serde_json::json!({"id":id,"title":title,"error":"Parent page export failed; skipping descendant."}));
+                    continue;
+                };
+                let directory = unique_directory(&parent_dir.join(sanitize_title(title)));
+                if let Err(error) = std::fs::create_dir_all(&directory) {
+                    failures
+                        .push(serde_json::json!({"id":id,"title":title,"error":error.to_string()}));
+                    continue;
+                }
+                match self.export_one_page(id, title, &directory, extension, options) {
+                    Ok(_) => {
+                        directories.insert(id.to_owned(), directory);
+                        exported += 1;
+                    }
+                    Err(error) => failures
+                        .push(serde_json::json!({"id":id,"title":title,"error":error.message})),
+                }
+            }
+        }
+        let marker = serde_json::json!({"exportedAt":chrono::Utc::now().to_rfc3339(),"pageId":root_id,"title":root.title,"tool":"confluence-cli"});
+        std::fs::write(
+            root_dir.join(EXPORT_MARKER),
+            serde_json::to_vec_pretty(&marker).unwrap_or_default(),
+        )
+        .map_err(|error| file_error("Could not write export marker", error))?;
+        Ok(
+            serde_json::json!({"rootDirectory":root_dir,"pageCount":pages.len(),"exported":exported,"failures":failures}),
+        )
+    }
+
+    fn export_one_page(
+        &self,
+        page_id: &str,
+        title: &str,
+        directory: &std::path::Path,
+        extension: &str,
+        options: &ExportOptions,
+    ) -> Result<(), ClientError> {
+        let filename = options.filename.as_deref().unwrap_or(match extension {
+            "md" => "page.md",
+            "html" => "page.html",
+            "txt" => "page.txt",
+            _ => "page.xml",
+        });
+        let relative = std::path::Path::new(filename);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(validation_error(
+                "Export filename must remain inside export directory.",
+            ));
+        }
+        let content = self.read(page_id, &options.format)?;
+        std::fs::create_dir_all(directory)
+            .map_err(|error| file_error("Could not create export directory", error))?;
+        std::fs::write(directory.join(relative), &content)
+            .map_err(|error| file_error("Could not write page export", error))?;
+        if !options.skip_attachments {
+            let referenced = if options.referenced_only {
+                if options.format == "storage" || options.format == "html" {
+                    referenced_attachment_names(&content)
+                } else {
+                    let storage = self.read(page_id, "storage")?;
+                    referenced_attachment_names(&storage)
+                }
+            } else {
+                std::collections::HashSet::new()
+            };
+            let exclude = split_patterns(options.exclude_attachments.as_deref());
+            let items = self.attachments(page_id)?["attachments"]
+                .as_array()
                 .cloned()
                 .unwrap_or_default();
-            if !items.is_empty() {
-                let attachment_dir = directory.join("attachments");
-                std::fs::create_dir_all(&attachment_dir).map_err(|error| ClientError {
-                    message: format!("Could not create attachments directory: {error}"),
-                    code: "UNKNOWN",
-                    status: None,
-                    details: None,
-                })?;
-                for item in items {
+            let selected = items
+                .into_iter()
+                .filter(|item| {
+                    let name = item.get("title").and_then(Value::as_str).unwrap_or("");
+                    options
+                        .pattern
+                        .as_deref()
+                        .is_none_or(|pattern| glob_match(pattern, name))
+                        && !exclude.iter().any(|pattern| {
+                            split_patterns(Some(pattern))
+                                .iter()
+                                .any(|part| glob_match(part, name))
+                        })
+                        && (!options.referenced_only || referenced.contains(name))
+                })
+                .collect::<Vec<_>>();
+            if !selected.is_empty() {
+                let attachment_dir = if options.attachments_dir.is_empty() {
+                    directory.to_owned()
+                } else {
+                    directory.join(&options.attachments_dir)
+                };
+                std::fs::create_dir_all(&attachment_dir)
+                    .map_err(|error| file_error("Could not create attachments directory", error))?;
+                for item in selected {
                     let Some(id) = item.get("id").and_then(Value::as_str) else {
                         continue;
                     };
@@ -2457,21 +2783,16 @@ impl ConfluenceClient {
                         .get("title")
                         .and_then(Value::as_str)
                         .unwrap_or("attachment");
-                    let path = attachment_dir.join(sanitize_path_component(name));
-                    let data = self.attachment_download(page_id, id)?;
-                    std::fs::write(path, data).map_err(|error| ClientError {
-                        message: format!("Could not write attachment: {error}"),
-                        code: "UNKNOWN",
-                        status: None,
-                        details: None,
-                    })?;
-                    downloaded += 1;
+                    let safe_name = sanitize_filename(name);
+                    let path = unique_file_path(&attachment_dir, &safe_name);
+                    let bytes = self.attachment_download(page_id, id)?;
+                    std::fs::write(path, bytes)
+                        .map_err(|error| file_error("Could not write attachment", error))?;
                 }
             }
         }
-        Ok(
-            serde_json::json!({"title":title,"contentPath":content_path,"attachmentCount":downloaded,"pageId":info.id}),
-        )
+        let _ = title;
+        Ok(())
     }
 
     fn resolve_api_url(&self, endpoint: &str) -> Result<String, ClientError> {
@@ -2815,8 +3136,80 @@ fn extract_macro_page_target(value: &str) -> Option<String> {
     None
 }
 
-fn sanitize_path_component(value: &str) -> String {
+const EXPORT_MARKER: &str = ".confluence-export.json";
+
+fn validation_error(message: &str) -> ClientError {
+    ClientError {
+        message: message.into(),
+        code: "VALIDATION",
+        status: None,
+        details: None,
+    }
+}
+
+fn validate_relative_component(value: &str, label: &str) -> Result<(), ClientError> {
+    let path = std::path::Path::new(value);
+    if path.is_absolute()
+        || path.components().count() != 1
+        || !matches!(
+            path.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return Err(validation_error(&format!(
+            "{label} must be a single directory name."
+        )));
+    }
+    Ok(())
+}
+
+fn file_error(context: &str, error: std::io::Error) -> ClientError {
+    ClientError {
+        message: format!("{context}: {error}"),
+        code: "UNKNOWN",
+        status: None,
+        details: None,
+    }
+}
+
+fn split_patterns(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn sanitize_title(value: &str) -> String {
     let cleaned = value
+        .chars()
+        .map(|character| {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+                )
+            {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let cleaned = cleaned.trim_start_matches('.').trim();
+    if cleaned.is_empty() {
+        "page".into()
+    } else {
+        cleaned.to_owned()
+    }
+}
+
+fn sanitize_filename(value: &str) -> String {
+    let normalized = value.replace('\\', "/");
+    let basename = normalized.rsplit('/').next().unwrap_or(value);
+    let cleaned = basename
         .chars()
         .map(|character| {
             if character.is_control()
@@ -2831,17 +3224,82 @@ fn sanitize_path_component(value: &str) -> String {
             }
         })
         .collect::<String>();
-    let cleaned = cleaned.trim().trim_matches('.');
+    let cleaned = cleaned.trim().trim_start_matches('.').trim();
     if cleaned.is_empty() {
-        "page".into()
+        "unnamed".into()
     } else {
-        cleaned.chars().take(120).collect()
+        cleaned.to_owned()
     }
+}
+
+fn unique_directory(candidate: &std::path::Path) -> std::path::PathBuf {
+    if !candidate.exists() {
+        return candidate.to_owned();
+    }
+    let name = candidate
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("page");
+    let parent = candidate
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut counter = 1;
+    loop {
+        let attempt = parent.join(format!("{name} ({counter})"));
+        if !attempt.exists() {
+            return attempt;
+        }
+        counter += 1;
+    }
+}
+
+fn unique_file_path(directory: &std::path::Path, filename: &str) -> std::path::PathBuf {
+    let candidate = directory.join(filename);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let path = std::path::Path::new(filename);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("attachment");
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!(".{value}"))
+        .unwrap_or_default();
+    let mut counter = 1;
+    loop {
+        let attempt = directory.join(format!("{stem} ({counter}){extension}"));
+        if !attempt.exists() {
+            return attempt;
+        }
+        counter += 1;
+    }
+}
+
+fn referenced_attachment_names(storage: &str) -> std::collections::HashSet<String> {
+    let marker = "ri:filename=\"";
+    let mut found = std::collections::HashSet::new();
+    let mut remaining = storage;
+    while let Some(offset) = remaining.find(marker) {
+        let after = &remaining[offset + marker.len()..];
+        let Some(end) = after.find('"') else {
+            break;
+        };
+        found.insert(after[..end].to_owned());
+        remaining = &after[end + 1..];
+    }
+    found
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use tempfile::tempdir;
 
     #[test]
     fn extracts_numeric_ids_from_supported_url_shapes() {
@@ -2858,5 +3316,127 @@ mod tests {
             extract_page_id("https://example.test/wiki/pages/nope/Title"),
             None
         );
+    }
+
+    fn test_client(
+        responses: Vec<(&'static str, &'static str)>,
+    ) -> (ConfluenceClient, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request);
+                let (content_type, payload) = if body.starts_with('{') || body.starts_with('[') {
+                    ("application/json", body)
+                } else {
+                    ("application/octet-stream", body)
+                };
+                let response = format!("HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}", payload.len());
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let config = Config {
+            base_url: format!("http://{address}/rest/api"),
+            api_path: "/rest/api".into(),
+            auth_type: "none".into(),
+            token: None,
+            email: None,
+            cookie: None,
+            site_url: None,
+            force_cloud: false,
+            read_only: false,
+            mtls: None,
+        };
+        (ConfluenceClient::new(config).unwrap(), handle)
+    }
+
+    #[test]
+    fn export_filters_attachments_uses_configured_directory_and_avoids_collisions() {
+        let (client, server) = test_client(vec![
+            (
+                "200 OK",
+                r#"{"id":"123","title":"Root","type":"page","status":"current","space":{"key":"ENG"},"version":{"number":1}}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"body":{"storage":{"value":"<p><ri:attachment ri:filename=\"keep.png\" /></p>"}}}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"results":[{"id":"1","title":"keep.png"},{"id":"2","title":"keep.png"},{"id":"3","title":"skip.txt"}],"_links":{}}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"id":"1","container":{"id":"123"},"_links":{"download":"/download/1"}}"#,
+            ),
+            ("200 OK", "first"),
+            (
+                "200 OK",
+                r#"{"id":"2","container":{"id":"123"},"_links":{"download":"/download/2"}}"#,
+            ),
+            ("200 OK", "second"),
+        ]);
+        let destination = tempdir().unwrap();
+        let options = ExportOptions {
+            format: "storage".into(),
+            filename: None,
+            recursive: false,
+            max_depth: 10,
+            exclude: None,
+            delay_ms: 0,
+            attachments_dir: "media".into(),
+            pattern: Some("*.png".into()),
+            exclude_attachments: Some("skip*".into()),
+            referenced_only: true,
+            skip_attachments: false,
+            dry_run: false,
+            overwrite: false,
+        };
+        let result = client
+            .export("123", destination.path().to_str().unwrap(), &options)
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(result["exported"], 1);
+        let media = destination.path().join("Root/media");
+        assert_eq!(std::fs::read(media.join("keep.png")).unwrap(), b"first");
+        assert_eq!(
+            std::fs::read(media.join("keep (1).png")).unwrap(),
+            b"second"
+        );
+        assert!(!media.join("skip.txt").exists());
+    }
+
+    #[test]
+    fn overwrite_refuses_unmarked_directory_and_title_sanitizer_matches_node_rules() {
+        assert_eq!(sanitize_title("... A/B. "), "A B.");
+        assert_eq!(sanitize_title("A/B."), "A B.");
+        let (client, server) = test_client(vec![(
+            "200 OK",
+            r#"{"id":"123","title":"Root","type":"page","status":"current","space":{"key":"ENG"},"version":{"number":1}}"#,
+        )]);
+        let destination = tempdir().unwrap();
+        std::fs::create_dir_all(destination.path().join("Root")).unwrap();
+        let options = ExportOptions {
+            format: "text".into(),
+            filename: None,
+            recursive: false,
+            max_depth: 10,
+            exclude: None,
+            delay_ms: 0,
+            attachments_dir: "attachments".into(),
+            pattern: None,
+            exclude_attachments: None,
+            referenced_only: false,
+            skip_attachments: true,
+            dry_run: false,
+            overwrite: true,
+        };
+        let error = client
+            .export("123", destination.path().to_str().unwrap(), &options)
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(error.message.contains("missing .confluence-export.json"));
     }
 }

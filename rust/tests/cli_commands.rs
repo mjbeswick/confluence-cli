@@ -17,6 +17,23 @@ fn mock_server(responses: Vec<(&'static str, &'static str)>) -> (String, thread:
     (format!("http://{address}"), handle)
 }
 
+fn export_mock_server(
+    responses: Vec<(&'static str, &'static str)>,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        for (status, body) in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            let response = format!("HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    (format!("http://{address}"), handle)
+}
+
 fn mock_server_checked(
     responses: Vec<(&'static str, &'static str, &'static str)>,
 ) -> (String, thread::JoinHandle<()>) {
@@ -36,6 +53,17 @@ fn mock_server_checked(
         }
     });
     (format!("http://{address}"), handle)
+}
+
+fn export_page_response(id: &'static str, title: &'static str, version: u32) -> &'static str {
+    match (id, title, version) {
+        ("123", "Root", 1) => {
+            r#"{"id":"123","title":"Root","type":"page","status":"current","space":{"key":"ENG"},"version":{"number":1},"_links":{"webui":"/spaces/ENG/pages/123/Root"}}"#
+        }
+        _ => {
+            r#"{"id":"123","title":"Root","type":"page","status":"current","space":{"key":"ENG"},"version":{"number":1}}"#
+        }
+    }
 }
 
 /// Spawn the CLI binary with a fully isolated environment so a developer's
@@ -462,5 +490,375 @@ fn local_convert_rejects_missing_formats_and_converts_markdown_without_auth() {
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         "<p>Hello</p><p>world &amp; friends</p>\n"
+    );
+}
+
+#[test]
+fn export_dry_run_accepts_filters_and_does_not_create_files() {
+    let (domain, server) =
+        export_mock_server(vec![("200 OK", export_page_response("123", "Root", 1))]);
+    let destination = tempfile::tempdir().unwrap();
+    let output = invoke(
+        &[
+            "export",
+            "123",
+            "--dest",
+            destination.path().to_str().unwrap(),
+            "--dry-run",
+            "--attachments-dir",
+            "media",
+            "--pattern",
+            "*.png",
+            "--exclude-attachments",
+            "secret*",
+            "--referenced-only",
+        ],
+        &domain,
+    );
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 page(s) selected"));
+    assert!(!destination.path().join("Root").exists());
+}
+
+#[test]
+fn recursive_export_writes_nested_pages_and_marker() {
+    let (domain, server) = export_mock_server(vec![
+        (
+            "200 OK",
+            r#"{"id":"123","title":"Root","type":"page","status":"current","space":{"key":"ENG"},"version":{"number":1}}"#,
+        ),
+        (
+            "200 OK",
+            r#"{"results":[{"id":"456","title":"Child","type":"page","space":{"key":"ENG"},"version":{"number":1},"_links":{"webui":"/child"}}],"_links":{}}"#,
+        ),
+        ("200 OK", r#"{"results":[],"_links":{}}"#),
+        (
+            "200 OK",
+            r#"{"body":{"storage":{"value":"<p>Root body</p>"}}}"#,
+        ),
+        (
+            "200 OK",
+            r#"{"body":{"storage":{"value":"<p>Child body</p>"}}}"#,
+        ),
+    ]);
+    let destination = tempfile::tempdir().unwrap();
+    let output = invoke(
+        &[
+            "export",
+            "123",
+            "--dest",
+            destination.path().to_str().unwrap(),
+            "--recursive",
+            "--delay-ms",
+            "0",
+            "--skip-attachments",
+            "--format",
+            "text",
+        ],
+        &domain,
+    );
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let root = destination.path().join("Root");
+    assert_eq!(
+        std::fs::read_to_string(root.join("page.txt")).unwrap(),
+        "Root body"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("Child/page.txt")).unwrap(),
+        "Child body"
+    );
+    assert!(root.join(".confluence-export.json").is_file());
+}
+
+#[test]
+fn recursive_export_dry_run_and_marker_guard_are_safe() {
+    let (domain, server) = export_mock_server(vec![
+        (
+            "200 OK",
+            r#"{"id":"123","title":"Root","type":"page","status":"current","space":{"key":"ENG"},"version":{"number":1}}"#,
+        ),
+        ("200 OK", r#"{"results":[],"_links":{}}"#),
+    ]);
+    let destination = tempfile::tempdir().unwrap();
+    let output = invoke(
+        &[
+            "export",
+            "123",
+            "--dest",
+            destination.path().to_str().unwrap(),
+            "--recursive",
+            "--dry-run",
+        ],
+        &domain,
+    );
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 page(s) selected"));
+    assert!(!destination.path().join("Root").exists());
+
+    let (domain, server) = export_mock_server(vec![(
+        "200 OK",
+        r#"{"id":"123","title":"Root","type":"page","status":"current","space":{"key":"ENG"},"version":{"number":1}}"#,
+    )]);
+    std::fs::create_dir_all(destination.path().join("Root")).unwrap();
+    let output = invoke(
+        &[
+            "export",
+            "123",
+            "--dest",
+            destination.path().to_str().unwrap(),
+            "--overwrite",
+        ],
+        &domain,
+    );
+    server.join().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("missing .confluence-export.json"));
+}
+
+#[test]
+fn single_export_overwrites_only_marker_owned_directory_and_removes_stale_files() {
+    let (domain, server) = export_mock_server(vec![
+        (
+            "200 OK",
+            r#"{"id":"123","title":"Root","type":"page","status":"current","space":{"key":"ENG"},"version":{"number":1}}"#,
+        ),
+        ("200 OK", r#"{"body":{"storage":{"value":"<p>First</p>"}}}"#),
+        (
+            "200 OK",
+            r#"{"id":"123","title":"Root","type":"page","status":"current","space":{"key":"ENG"},"version":{"number":2}}"#,
+        ),
+        (
+            "200 OK",
+            r#"{"body":{"storage":{"value":"<p>Replaced</p>"}}}"#,
+        ),
+    ]);
+    let destination = tempfile::tempdir().unwrap();
+    let args = [
+        "export",
+        "123",
+        "--dest",
+        destination.path().to_str().unwrap(),
+        "--skip-attachments",
+        "--format",
+        "text",
+    ];
+    let first = invoke(&args, &domain);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let root = destination.path().join("Root");
+    std::fs::write(root.join("stale.txt"), "stale").unwrap();
+    let overwrite = invoke(
+        &[
+            "export",
+            "123",
+            "--dest",
+            destination.path().to_str().unwrap(),
+            "--skip-attachments",
+            "--format",
+            "text",
+            "--overwrite",
+        ],
+        &domain,
+    );
+    server.join().unwrap();
+    assert!(
+        overwrite.status.success(),
+        "{}",
+        String::from_utf8_lossy(&overwrite.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("page.txt")).unwrap(),
+        "Replaced"
+    );
+    assert!(!root.join("stale.txt").exists());
+    assert!(root.join(".confluence-export.json").is_file());
+}
+
+#[test]
+fn copy_tree_honors_copy_suffix_exclusion_depth_and_json_preview() {
+    let (domain, server) = mock_server(vec![
+        (
+            "200 OK",
+            r#"{"id":"20","title":"Target","type":"page","status":"current","space":{"key":"ENG"},"version":{"number":9}}"#,
+        ),
+        (
+            "200 OK",
+            r#"{"id":"10","title":"Source","type":"page","status":"current","space":{"key":"ENG"},"version":{"number":7}}"#,
+        ),
+        (
+            "200 OK",
+            r#"{"results":[{"id":"11","title":"Keep","type":"page","space":{"key":"ENG"},"version":{"number":1}}],"_links":{}}"#,
+        ),
+        ("200 OK", r#"{"results":[],"_links":{}}"#),
+    ]);
+    let output = invoke(
+        &[
+            "copy-tree",
+            "10",
+            "20",
+            "--exclude",
+            "Skip*",
+            "--copy-suffix",
+            " - duplicated",
+            "--dry-run",
+            "--json",
+        ],
+        &domain,
+    );
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let preview: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(preview["rootTitle"], "Source - duplicated");
+    assert_eq!(preview["childCount"], 1);
+    assert_eq!(preview["targetParentVersion"], 9);
+}
+
+#[test]
+fn versions_purge_deletes_historical_versions_newest_first() {
+    let (domain, server) = mock_server_checked(vec![
+        (
+            "200 OK",
+            r#"{"results":[{"number":1},{"number":2},{"number":3}] }"#,
+            "GET /rest/api/content/123/version",
+        ),
+        (
+            "200 OK",
+            r#"{"results":[{"number":1},{"number":2},{"number":3}] }"#,
+            "GET /rest/api/content/123/version",
+        ),
+        (
+            "204 No Content",
+            "",
+            "DELETE /rest/api/content/123/version/2",
+        ),
+        (
+            "204 No Content",
+            "",
+            "DELETE /rest/api/content/123/version/1",
+        ),
+    ]);
+    let output = invoke(&["versions-purge", "123", "--yes", "--json"], &domain);
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["deleted"], 2);
+    assert_eq!(value["kept"], 3);
+}
+
+#[test]
+fn copy_tree_executes_pages_in_hierarchy_and_maps_created_parent_ids() {
+    let (domain, server) = mock_server_checked(vec![
+        (
+            "200 OK",
+            r#"{"id":"20","title":"Target","type":"page","status":"current","space":{"key":"ENG"},"version":{"number":1}}"#,
+            "GET /rest/api/content/20",
+        ),
+        (
+            "200 OK",
+            r#"{"id":"10","title":"Source","type":"page","status":"current","space":{"key":"ENG"},"version":{"number":2}}"#,
+            "GET /rest/api/content/10",
+        ),
+        (
+            "200 OK",
+            r#"{"results":[{"id":"11","title":"Child","type":"page","space":{"key":"ENG"},"version":{"number":1}}],"_links":{}}"#,
+            "GET /rest/api/content/10/child/page",
+        ),
+        (
+            "200 OK",
+            r#"{"results":[{"id":"12","title":"Grandchild","type":"page","space":{"key":"ENG"},"version":{"number":1}}],"_links":{}}"#,
+            "GET /rest/api/content/11/child/page",
+        ),
+        (
+            "200 OK",
+            r#"{"results":[],"_links":{}}"#,
+            "GET /rest/api/content/12/child/page",
+        ),
+        (
+            "200 OK",
+            r#"{"id":"10","title":"Source","body":{"storage":{"value":"root body"}},"space":{"key":"ENG"}}"#,
+            "GET /rest/api/content/10?expand=body.storage%2Cspace",
+        ),
+        (
+            "200 OK",
+            r#"{"id":"100","title":"Source (Copy)"}"#,
+            "POST /rest/api/content",
+        ),
+        (
+            "200 OK",
+            r#"{"id":"11","title":"Child","body":{"storage":{"value":"child body"}},"space":{"key":"ENG"}}"#,
+            "GET /rest/api/content/11?expand=body.storage%2Cspace",
+        ),
+        (
+            "200 OK",
+            r#"{"id":"101","title":"Child"}"#,
+            "POST /rest/api/content",
+        ),
+        (
+            "200 OK",
+            r#"{"id":"12","title":"Grandchild","body":{"storage":{"value":"grand body"}},"space":{"key":"ENG"}}"#,
+            "GET /rest/api/content/12?expand=body.storage%2Cspace",
+        ),
+        (
+            "200 OK",
+            r#"{"id":"102","title":"Grandchild"}"#,
+            "POST /rest/api/content",
+        ),
+    ]);
+    let output = invoke(
+        &["copy-tree", "10", "20", "--delay-ms", "0", "--json"],
+        &domain,
+    );
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["totalCopied"], 3);
+    assert_eq!(value["rootPage"]["id"], "100");
+    assert_eq!(value["rootPage"]["title"], "Source (Copy)");
+}
+
+#[test]
+fn versions_purge_noop_matches_node_json_shape() {
+    let (domain, server) = mock_server(vec![("200 OK", r#"{"results":[{"number":4}] }"#)]);
+    let output = invoke(&["versions-purge", "123", "--yes", "--json"], &domain);
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({"id":"123","deleted":0,"failed":0,"kept":4})
     );
 }
